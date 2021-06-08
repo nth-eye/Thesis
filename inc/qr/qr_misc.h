@@ -176,7 +176,7 @@ constexpr void GF_PolyDiv(const uint8_t *dividend, size_t len, const uint8_t *di
 {
     memset(result, 0, degree);
 
-    for (int i = 0; i < len; ++i) {
+    for (size_t i = 0; i < len; ++i) {
 
         uint8_t factor = dividend[i] ^ result[0];
 

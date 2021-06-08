@@ -32,15 +32,16 @@ private:
     void encode_ecc(const uint8_t *data, ECC ecc, uint8_t *out);
 
     void add_data(const uint8_t *data, const uint8_t *patterns);
-    void add_patterns(ECC ecc);
+    void add_patterns();
     void add_version();
     void add_format(ECC ecc, int mask);
-
-    void draw_rect(int y, int x, int height, int width, bool black, uint8_t *out);
-    void draw_bound(int y, int x, int height, int width, bool black, uint8_t *out);
-
     void reserve_patterns(uint8_t *out);
 
+    template<bool Black>
+    void draw_rect(int y, int x, int height, int width, uint8_t *out);
+    template<bool Black>
+    void draw_bound(int y, int x, int height, int width, uint8_t *out);
+    
     template<bool Horizontal>
     int  rule_1_3_score();
     int  penalty_score();
@@ -97,7 +98,7 @@ bool QR<V>::encode(const char *str, size_t len, ECC ecc, int mask)
     memcpy(code, patterns, N_BYTES);
 
     add_data(data_with_ecc, patterns);
-    add_patterns(ecc);
+    add_patterns();
     add_version();
 
     mask = mask != -1 ? mask & 7 : select_mask(ecc, patterns);
@@ -113,6 +114,7 @@ bool QR<V>::encode_data(const char *data, size_t len, ECC ecc, uint8_t *out)
 {
     Mode mode = QR_SelectMode(data, len);
 
+    size_t n_bits = (N_DAT_CAPACITY - ECC_CODEWORDS_PER_BLOCK[ecc][V] * N_ECC_BLOCKS[ecc][V]) << 3;
     size_t pos = 0;
 
     add_bits(1 << mode, 4, out, pos);
@@ -120,36 +122,64 @@ bool QR<V>::encode_data(const char *data, size_t len, ECC ecc, uint8_t *out)
 
     if (mode == M_NUMERIC) {
 
-        int i = 0, j;
+        const size_t triplets = len / 3;
+        const size_t triplets_size = triplets * 3;
+        const size_t rem = len % 3;
+        const size_t rem_bits = rem == 2 ? 7 : rem == 1 ? 4 : 0;
+        const size_t total_size = 10 * triplets + rem_bits;
 
-        while (i < len) {
+        if (pos + total_size > n_bits)
+            return false;
 
-            char buf[4];
+        char buf[4] = {};
 
-            for (j = 0; j < 3 && i < len; ++j, ++i)
-                buf[j] = data[i];
-            buf[j] = 0;
+        for (size_t i = 0; i < triplets_size; i += 3) {
+            buf[0] = data[i];
+            buf[1] = data[i + 1];
+            buf[2] = data[i + 2];
 
             uint16_t num = strtol(buf, NULL, 10);
-            add_bits(num, num < 100 ? num < 10 ? 4 : 7 : 10, out, pos);
+            add_bits(num, 10, out, pos);
+        }
+
+        if (rem) {
+            buf[0] = data[triplets_size];
+            buf[1] = data[triplets_size + 1];
+            buf[rem] = 0;
+
+            uint16_t num = strtol(buf, NULL, 10);
+            add_bits(num, rem_bits, out, pos);
         }
     } else if (mode == M_ALPHANUMERIC) {
 
-        for (int i = 0; i < (int)(len & ~1); i += 2) {
+        if (pos + 11 * (int(len & ~1ul) / 2) > n_bits)
+            return false;
+
+        for (int i = 0; i < int(len & ~1ul); i += 2) {
             uint16_t num = QR_Alphanumeric(data[i]) * 45 + QR_Alphanumeric(data[i + 1]);
             add_bits(num, 11, out, pos);
         }
-        if (len & 1)
+        if (len & 1) {
+            if (pos + 6 > n_bits)
+                return false;
+
             add_bits(QR_Alphanumeric(data[len - 1]), 6, out, pos);
+        }
 
     } else if (mode == M_BYTE) {
 
-        for (int i = 0; i < len; ++i)
+        if (pos + len * 8 > n_bits)
+            return false;
+
+        for (size_t i = 0; i < len; ++i)
             add_bits(data[i], 8, out, pos);
 
     } else {
 
-        for (int i = 0; i < len; i += 2) {
+        if (pos + 13 * (len / 2) > n_bits)
+            return false;
+
+        for (size_t i = 0; i < len; i += 2) {
             uint16_t val = ((uint8_t) data[i]) | (((uint8_t) data[i + 1]) << 8);
             uint16_t res = 0;
             val -= val < 0x9FFC ? 0x8140 : 0xC140;
@@ -159,18 +189,13 @@ bool QR<V>::encode_data(const char *data, size_t len, ECC ecc, uint8_t *out)
         }
     }
 
-    // Padding
-    int n_bits = (N_DAT_CAPACITY - ECC_CODEWORDS_PER_BLOCK[ecc][V] * N_ECC_BLOCKS[ecc][V]) << 3;
-    int padding = n_bits - pos;
-    int i = 0;
+    size_t padding = n_bits - pos;
+    size_t i = 0;
 
-    if (padding >= 0)
-        add_bits(0, padding > 4 ? 4 : padding, out, pos);
-    else 
-        return false;  // If data is too big for the version
+    add_bits(0, padding > 4 ? 4 : padding, out, pos);
     
     if (pos & 7)
-        add_bits(0, 8 - pos & 7, out, pos);
+        add_bits(0, (8 - pos) & 7, out, pos);
 
     while (pos < n_bits)
         add_bits(++i & 1 ? 0xec : 0x11, 8, out, pos);
@@ -252,12 +277,12 @@ void QR<V>::add_data(const uint8_t *data, const uint8_t *patterns)
 }
 
 template<int V>
-void QR<V>::add_patterns(ECC ecc)
+void QR<V>::add_patterns()
 {
     // White bounds inside finders
-    draw_bound(1, 1, 5, 5, false, code);
-    draw_bound(1, SIDE - 6, 5, 5, false, code);
-    draw_bound(SIDE - 6, 1, 5, 5, false, code);
+    draw_bound<false>(1, 1, 5, 5, code);
+    draw_bound<false>(1, SIDE - 6, 5, 5, code);
+    draw_bound<false>(SIDE - 6, 1, 5, 5, code);
 
     // Finish alignment patterns
     for (int i = 0; i < N_ALIGN; ++i) {
@@ -266,17 +291,17 @@ void QR<V>::add_patterns(ECC ecc)
                 (!i && j == N_ALIGN - 1) || 
                 (!j && i == N_ALIGN - 1) )
                 continue;
-            draw_bound(ALIGN_POS[V][i] - 1, ALIGN_POS[V][j] - 1, 3, 3, false, code);
+            draw_bound<false>(ALIGN_POS[V][i] - 1, ALIGN_POS[V][j] - 1, 3, 3, code);
         }
     }
 
     // Draw white separators
-    draw_rect(7, 0, 1, 8, false, code);
-    draw_rect(0, 7, 8, 1, false, code);
-    draw_rect(SIDE - 8, 0, 1, 8, false, code);
-    draw_rect(SIDE - 8, 7, 8, 1, false, code);
-    draw_rect(7, SIDE - 8, 1, 8, false, code);
-    draw_rect(0, SIDE - 8, 8, 1, false, code);
+    draw_rect<false>(7, 0, 1, 8, code);
+    draw_rect<false>(0, 7, 8, 1, code);
+    draw_rect<false>(SIDE - 8, 0, 1, 8, code);
+    draw_rect<false>(SIDE - 8, 7, 8, 1, code);
+    draw_rect<false>(7, SIDE - 8, 1, 8, code);
+    draw_rect<false>(0, SIDE - 8, 8, 1, code);
 
     // Perforate timing patterns
     for (int i = 7; i < SIDE - 7; i += 2) {
@@ -364,9 +389,10 @@ void QR<V>::add_format(ECC ecc, int mask)
 }
 
 template<int V>
-void QR<V>::draw_rect(int y, int x, int height, int width, bool black, uint8_t *out)
+template<bool B>
+void QR<V>::draw_rect(int y, int x, int height, int width, uint8_t *out)
 {
-    if (black) {
+    if (B) {
         for (int dy = y * SIDE; dy < (y + height) * SIDE; dy += SIDE)
             for (int dx = x; dx < x + width; ++dx) 
                 set_bit(out, dy + dx);
@@ -378,9 +404,10 @@ void QR<V>::draw_rect(int y, int x, int height, int width, bool black, uint8_t *
 }
 
 template<int V>
-void QR<V>::draw_bound(int y, int x, int height, int width, bool black, uint8_t *out)
+template<bool B>
+void QR<V>::draw_bound(int y, int x, int height, int width, uint8_t *out)
 {
-    if (black) {
+    if (B) {
         for (int i = y * SIDE + x;              i < y * SIDE + x+width;                 ++i)
             set_bit(out, i);
         for (int i = (y+height-1) * SIDE + x;   i < (y+height-1) * SIDE + x+width;      ++i)
@@ -404,12 +431,12 @@ void QR<V>::draw_bound(int y, int x, int height, int width, bool black, uint8_t 
 template<int V>
 void QR<V>::reserve_patterns(uint8_t *out)
 {
-    draw_rect(0, 6, SIDE, 1, true, out);
-    draw_rect(6, 0, 1, SIDE, true, out);
+    draw_rect<true>(0, 6, SIDE, 1, out);
+    draw_rect<true>(6, 0, 1, SIDE, out);
     
-    draw_rect(0, 0, 9, 9, true, out);
-    draw_rect(SIDE - 8, 0, 8, 9, true, out);
-    draw_rect(0, SIDE - 8, 9, 8, true, out);
+    draw_rect<true>(0, 0, 9, 9, out);
+    draw_rect<true>(SIDE - 8, 0, 8, 9, out);
+    draw_rect<true>(0, SIDE - 8, 9, 8, out);
 
     for (int i = 0; i < N_ALIGN; ++i) {
         for (int j = 0; j < N_ALIGN; ++j) {
@@ -417,13 +444,13 @@ void QR<V>::reserve_patterns(uint8_t *out)
                 (!i && j == N_ALIGN - 1) || 
                 (!j && i == N_ALIGN - 1) )
                 continue;
-            draw_rect(ALIGN_POS[V][i] - 2, ALIGN_POS[V][j] - 2, 5, 5, true, out);
+            draw_rect<true>(ALIGN_POS[V][i] - 2, ALIGN_POS[V][j] - 2, 5, 5, out);
         }
     }
 
     if (V >= 7) {
-        draw_rect(SIDE - 11, 0, 3, 6, true, out);
-        draw_rect(0, SIDE - 11, 6, 3, true, out);
+        draw_rect<true>(SIDE - 11, 0, 3, 6, out);
+        draw_rect<true>(0, SIDE - 11, 6, 3, out);
     }
 }
 
@@ -528,11 +555,11 @@ void QR<V>::apply_mask(int mask, const uint8_t *patterns)
             bool keep = true;
 
             switch (mask) {
-                case 0: keep =  x + y & 1;                  break;
+                case 0: keep = (x + y) & 1;                 break;
                 case 1: keep =  y & 1;                      break;
                 case 2: keep =  x % 3;                      break;
                 case 3: keep = (x + y) % 3;                 break;
-                case 4: keep =  y / 2 + x / 3 & 1;          break;
+                case 4: keep = (y / 2 + x / 3) & 1;         break;
                 case 5: keep =  x * y  % 2 + x * y % 3;     break;
                 case 6: keep =  x * y  % 2 + x * y % 3 & 1; break;
                 case 7: keep = (x + y) % 2 + x * y % 3 & 1; break;
